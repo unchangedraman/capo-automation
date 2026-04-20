@@ -1,0 +1,40 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: ${CNPG_CLUSTER_NAME}
+  namespace: ${CNPG_NAMESPACE}
+spec:
+  instances: ${CNPG_INSTANCES}
+  imageName: ${PG_IMAGE}
+
+  minSyncReplicas: ${CNPG_MIN_SYNC}
+  maxSyncReplicas: ${CNPG_MAX_SYNC}
+
+  postgresql:
+    parameters:
+      max_connections: "${PG_MAX_CONNECTIONS}"
+      shared_buffers: "${PG_SHARED_BUFFERS}"
+      effective_cache_size: "${PG_EFFECTIVE_CACHE_SIZE}"
+      wal_keep_size: "${PG_WAL_KEEP_SIZE}"
+
+  bootstrap:
+    initdb:
+      database: ${DB_NAME}
+      owner: ${DB_OWNER}
+
+  storage:
+    size: ${STORAGE_SIZE}
+    storageClass: ${STORAGE_CLASS}
+
+  resources:
+    requests:
+      cpu: "${PG_CPU_REQUEST}"
+      memory: "${PG_MEM_REQUEST}"
+    limits:
+      cpu: "${PG_CPU_LIMIT}"
+      memory: "${PG_MEM_LIMIT}"
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required

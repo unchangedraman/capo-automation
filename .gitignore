@@ -1,0 +1,26 @@
+# Runtime artifacts (rendered from .tmpl at script execution time)
+cloud.conf
+cluster-template.yaml
+manifests/cnpg-cluster.yaml
+
+# Kubeconfigs (never commit)
+*.kubeconfig
+*-kubeconfig
+kubeconfig
+
+# Local config overrides with real credentials
+config.*.env
+!config.env
+
+# Backups
+*.bak
+*.backup
+*.backup-*
+
+# Editor/OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+manifests/cnpg-pooler.yaml
