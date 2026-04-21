@@ -60,6 +60,44 @@ check_external_network() {
   fi
 }
 
+check_octavia() {
+  if openstack loadbalancer list >/dev/null 2>&1; then
+    echo "Octavia reachable (LB service answering)"
+  else
+    echo "ERROR: Octavia (load-balancer) not reachable — CAPO needs it for the kube-apiserver LB." >&2
+    echo "Check: openstack endpoint list --service load-balancer" >&2
+    exit 1
+  fi
+}
+
+check_cinder() {
+  if openstack volume type list -f value -c Name >/dev/null 2>&1; then
+    echo "Cinder reachable (volume types listable)"
+  else
+    echo "ERROR: Cinder (volumev3) not reachable — PVCs will fail." >&2
+    exit 1
+  fi
+}
+
+check_quota() {
+  local need_cpu=$(( (CP_REPLICAS + WORKER_REPLICAS) * 2 ))
+  local need_ram=$(( (CP_REPLICAS + WORKER_REPLICAS) * 4096 ))
+  local need_vols=$(( CNPG_INSTANCES ))
+  local cur
+  cur=$(openstack quota show -f value -c cores 2>/dev/null || echo 0)
+  [ "$cur" -lt "$need_cpu" ] 2>/dev/null \
+    && echo "WARN: cores quota ($cur) < needed ($need_cpu)" \
+    || echo "cores quota OK ($cur >= $need_cpu)"
+  cur=$(openstack quota show -f value -c ram 2>/dev/null || echo 0)
+  [ "$cur" -lt "$need_ram" ] 2>/dev/null \
+    && echo "WARN: ram quota ($cur MiB) < needed ($need_ram MiB)" \
+    || echo "ram quota OK ($cur MiB >= $need_ram MiB)"
+  cur=$(openstack quota show -f value -c volumes 2>/dev/null || echo 0)
+  [ "$cur" -lt "$need_vols" ] 2>/dev/null \
+    && echo "WARN: volumes quota ($cur) < needed ($need_vols)" \
+    || echo "volumes quota OK ($cur >= $need_vols)"
+}
+
 echo '========== Bootstrapping OpenStack resources =========='
 
 echo; echo 'Step 1: verify image (admin prerequisite)'
@@ -68,11 +106,18 @@ check_image
 echo; echo 'Step 2: verify external network (admin prerequisite)'
 check_external_network
 
-echo; echo 'Step 3: flavors'
+echo; echo 'Step 3: verify Octavia + Cinder services'
+check_octavia
+check_cinder
+
+echo; echo 'Step 4: verify project quota'
+check_quota
+
+echo; echo 'Step 5: flavors'
 ensure_flavor "${CP_FLAVOR}"     2 4096 20
 ensure_flavor "${WORKER_FLAVOR}" 2 4096 20
 
-echo; echo 'Step 4: SSH keypair'
+echo; echo 'Step 6: SSH keypair'
 ensure_keypair "${SSH_KEY_NAME}"
 
 echo

@@ -17,6 +17,9 @@ config.*.env
 *.backup
 *.backup-*
 
+# Image-build outputs (qcow2, image-builder clone, manifests)
+build-output/
+
 # Editor/OS junk
 .DS_Store
 .idea/

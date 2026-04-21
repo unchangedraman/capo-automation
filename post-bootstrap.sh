@@ -23,6 +23,16 @@ echo "Fetching workload kubeconfig..."
 clusterctl get kubeconfig "$CLUSTER_NAME" > "/tmp/${CLUSTER_NAME}-kubeconfig"
 export KUBECONFIG="/tmp/${CLUSTER_NAME}-kubeconfig"
 
+# Gate: workload API /healthz must answer before we proceed
+echo "Probing workload API /healthz..."
+for i in $(seq 1 60); do
+  if kubectl get --raw /healthz 2>/dev/null | grep -q '^ok$'; then
+    echo "  API healthy"; break
+  fi
+  [ "$i" = "60" ] && { echo "ERROR: workload API never returned /healthz=ok" >&2; exit 1; }
+  sleep 5
+done
+
 # Wait for nodes
 echo "Waiting for nodes to appear..."
 for i in $(seq 1 30); do
@@ -76,6 +86,44 @@ for i in $(seq 1 30); do
   sleep 10
 done
 
+# Gate: PVC smoke test — prove StorageClass can actually bind a volume.
+# Catches mis-wired Cinder CSI before CNPG hangs with unhelpful errors.
+echo
+echo "Smoke-testing ${STORAGE_CLASS} StorageClass with a 1Gi PVC + pod..."
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: csi-smoke, namespace: default }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ${STORAGE_CLASS}
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: csi-smoke, namespace: default }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh","-c","echo ok > /data/probe && sleep 30"]
+    volumeMounts: [{ name: v, mountPath: /data }]
+  volumes:
+  - name: v
+    persistentVolumeClaim: { claimName: csi-smoke }
+EOF
+bound=false
+for i in $(seq 1 36); do
+  phase=$(kubectl -n default get pvc csi-smoke -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  [ "$phase" = "Bound" ] && bound=true && break
+  sleep 5
+done
+kubectl -n default delete pod csi-smoke --wait=false >/dev/null 2>&1 || true
+kubectl -n default delete pvc csi-smoke --wait=false >/dev/null 2>&1 || true
+$bound || { echo "ERROR: PVC csi-smoke never reached Bound — Cinder CSI mis-wired." >&2; exit 1; }
+echo "  storage OK (PVC bound)"
+
 # 6. CNPG operator
 echo
 echo "========== Installing CloudNativePG ${CNPG_VERSION} =========="
@@ -117,7 +165,25 @@ echo "Granting schema permissions to ${DB_OWNER}..."
 kubectl -n "${CNPG_NAMESPACE}" exec "${CNPG_CLUSTER_NAME}-1" -c postgres -- \
   psql -U postgres -d "${DB_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_OWNER};" 2>&1 | tail -1
 
-# 10. Final status
+# 10. SQL smoke test — prove the DB actually answers
+echo
+echo "SQL smoke test (SELECT 1 on primary)..."
+if kubectl -n "${CNPG_NAMESPACE}" exec "${CNPG_CLUSTER_NAME}-1" -c postgres -- \
+     psql -U postgres -d "${DB_NAME}" -tAc 'SELECT 1;' 2>/dev/null | grep -q '^1$'; then
+  echo "  primary answered: OK"
+else
+  echo "ERROR: SELECT 1 on ${CNPG_CLUSTER_NAME}-1 did not return 1" >&2
+  exit 1
+fi
+
+ready=$(kubectl -n "${CNPG_NAMESPACE}" get cluster "${CNPG_CLUSTER_NAME}" -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo 0)
+if [ "$ready" = "${CNPG_INSTANCES}" ]; then
+  echo "  replicas in sync: ${ready}/${CNPG_INSTANCES}"
+else
+  echo "WARN: only ${ready}/${CNPG_INSTANCES} replicas ready — cluster still converging"
+fi
+
+# 11. Final status
 echo
 echo "========== Bootstrap Complete =========="
 kubectl get nodes -o wide
