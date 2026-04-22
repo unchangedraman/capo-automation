@@ -18,6 +18,15 @@ spec:
   template:
     spec:
       files: []
+      preKubeadmCommands:
+        # See note on the KubeadmControlPlane block — same sandbox_image fix
+        # is required on workers; they use the same image and containerd.
+        - |
+          if ! grep -q 'sandbox_image = "registry.k8s.io/pause:3.9"' /etc/containerd/config.toml 2>/dev/null; then
+            sed -i 's|sandbox_image = "registry.k8s.io/pause:[^"]*"|sandbox_image = "registry.k8s.io/pause:3.9"|' /etc/containerd/config.toml
+            systemctl restart containerd
+            sleep 3
+          fi
       joinConfiguration:
         nodeRegistration:
           kubeletExtraArgs:
@@ -84,7 +93,86 @@ spec:
       controllerManager:
         extraArgs:
           cloud-provider: external
-    files: []
+    files:
+      # Background watchdog: if kubeadm init hasn't succeeded in 5 minutes,
+      # dump kubelet + containerd state to the serial console so that
+      # `openstack console log show` exposes the root cause even when the
+      # tenant subnet is unreachable from outside. Harmless on success (exits
+      # early). Shipped on control-plane nodes only.
+      - path: /usr/local/bin/capo-kubeadm-debug.sh
+        permissions: "0755"
+        owner: root:root
+        content: |
+          #!/bin/bash
+          exec >/dev/ttyS0 2>&1
+          sleep 300
+          if systemctl is-active --quiet kubelet && \
+             curl -skf https://127.0.0.1:6443/healthz >/dev/null 2>&1; then
+            echo "=== CAPO-DEBUG: apiserver healthy at $(date -u +%FT%TZ) ==="
+            exit 0
+          fi
+          echo
+          echo "================ CAPO-DEBUG DUMP $(date -u +%FT%TZ) ================"
+          echo '---- uname / uptime / kernel modules ----'
+          uname -a; uptime
+          lsmod | egrep 'br_netfilter|overlay|nf_conntrack' || echo '(missing modules)'
+          echo '---- sysctl ----'
+          sysctl net.bridge.bridge-nf-call-iptables net.ipv4.ip_forward 2>&1
+          echo '---- containerd ----'
+          systemctl is-active containerd; systemctl status containerd --no-pager -l | head -20
+          echo '---- kubelet ----'
+          systemctl is-active kubelet; systemctl status kubelet --no-pager -l | head -30
+          echo '---- kubelet journal tail ----'
+          journalctl -u kubelet --no-pager -n 120
+          echo '---- static pod manifests ----'
+          ls -la /etc/kubernetes/manifests/ 2>&1
+          echo '---- containerd config.toml (sandbox_image + SystemdCgroup) ----'
+          if [ -f /etc/containerd/config.toml ]; then
+            grep -E 'sandbox_image|SystemdCgroup' /etc/containerd/config.toml || echo "(no sandbox_image/SystemdCgroup lines in config)"
+            ls -la /etc/containerd/
+          else
+            echo "(config.toml does not exist)"
+          fi
+          echo '---- containerd drop-in conf.d ----'
+          ls -la /etc/containerd/conf.d/ 2>/dev/null || echo "(no conf.d)"
+          echo '---- crictl ps -a ----'
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a 2>&1 | head -30
+          echo '---- crictl images (head) ----'
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock images 2>&1 | head -30
+          echo '---- /var/log/capo-prekubeadm.log (our preKubeadmCommand trace) ----'
+          cat /var/log/capo-prekubeadm.log 2>/dev/null || echo "(file missing — preKubeadmCommand did not run)"
+          echo '---- apiserver container logs (if any) ----'
+          apid=$(crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a 2>/dev/null | awk '/kube-apiserver/{print $1; exit}')
+          [ -n "$apid" ] && crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock logs "$apid" 2>&1 | tail -40
+          echo '---- cloud-init-output tail ----'
+          tail -40 /var/log/cloud-init-output.log 2>/dev/null
+          echo "================ END CAPO-DEBUG DUMP ================"
+    preKubeadmCommands:
+      # Force containerd's sandbox_image to the pause version kubeadm pre-pulled
+      # for this K8s release. image-builder's `kubeadm config images pull` for
+      # v1.29 pulls pause:3.9, but containerd 1.7+ defaults sandbox_image to
+      # pause:3.10 — on air-gapped tenant VMs this leaves every static pod
+      # stuck in CreatePodSandboxError trying to pull pause:3.10.
+      - |
+        { set -x
+          # image-builder (current rev) ships containerd v2.x, whose default
+          # sandbox_image is pause:3.10.1. Our air-gapped lab can't pull from
+          # registry.k8s.io, but pause:3.9 *is* pre-loaded (kubeadm images pull
+          # at image-build time). containerd v2 changed the config schema, so
+          # sed-patching sandbox_image won't work reliably. Instead, locally
+          # retag the pre-pulled pause:3.9 as whatever containerd's default
+          # sandbox_image happens to be — it'll then "pull" from local cache
+          # and succeed. Versions we know can be the default: 3.10, 3.10.1.
+          CTR=$(command -v ctr || echo /usr/local/bin/ctr)
+          SRC=registry.k8s.io/pause:3.9
+          for TGT in registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1; do
+            if ! "$CTR" --namespace=k8s.io images ls -q | grep -qx "$TGT"; then
+              "$CTR" --namespace=k8s.io images tag --force "$SRC" "$TGT" || true
+            fi
+          done
+          "$CTR" --namespace=k8s.io images ls 2>&1 | grep pause || true
+        } 2>&1 | tee /var/log/capo-prekubeadm.log
+      - nohup /usr/local/bin/capo-kubeadm-debug.sh </dev/null >/dev/null 2>&1 &
     initConfiguration:
       nodeRegistration:
         kubeletExtraArgs:
@@ -139,6 +227,12 @@ spec:
         name: ${CLUSTER_NAME}-cloud-config
       image: ${IMAGE_NAME}
       sshKeyName: ${SSH_KEY_NAME}
+      # Extra SG opens Cilium VXLAN overlay + health ports. See
+      # bootstrap-openstack-resources.sh:ensure_cilium_overlay_sg. Without
+      # this, cross-node pod traffic is silently dropped (CAPO's managed
+      # SGs don't include UDP 8472).
+      securityGroups:
+        - name: ${CILIUM_OVERLAY_SG_NAME}
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
 kind: OpenStackMachineTemplate
@@ -156,3 +250,5 @@ spec:
         name: ${CLUSTER_NAME}-cloud-config
       image: ${IMAGE_NAME}
       sshKeyName: ${SSH_KEY_NAME}
+      securityGroups:
+        - name: ${CILIUM_OVERLAY_SG_NAME}

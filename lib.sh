@@ -13,14 +13,39 @@ load_config() {
 
 render_template() {
   local src="$1" dst="$2"
-  envsubst < "$src" > "$dst"
+  # Restrict envsubst to an explicit allowlist so shell-style $vars inside
+  # embedded scripts (preKubeadmCommands, files.content, etc.) are preserved
+  # instead of silently expanded to empty strings. Any variable referenced in
+  # a template must be added here.
+  local allow='$CLUSTER_NAME $CLOUD_NAME $CLOUDS_YAML_B64
+    $EXTERNAL_NETWORK_ID $NODE_CIDR $POD_CIDR
+    $CP_FLAVOR $WORKER_FLAVOR $IMAGE_NAME $SSH_KEY_NAME
+    $K8S_VERSION $CP_REPLICAS $WORKER_REPLICAS
+    $CILIUM_OVERLAY_SG_NAME
+    $CNPG_VERSION $CNPG_NAMESPACE $CNPG_CLUSTER_NAME $CNPG_INSTANCES
+    $CNPG_MIN_SYNC $CNPG_MAX_SYNC $STORAGE_CLASS $STORAGE_SIZE
+    $PG_IMAGE $DB_NAME $DB_OWNER
+    $PG_MAX_CONNECTIONS $PG_SHARED_BUFFERS $PG_EFFECTIVE_CACHE_SIZE $PG_WAL_KEEP_SIZE
+    $PG_CPU_REQUEST $PG_MEM_REQUEST $PG_CPU_LIMIT $PG_MEM_LIMIT
+    $OS_AUTH_URL $OS_USERNAME $OS_PASSWORD $OS_PROJECT_NAME
+    $OS_USER_DOMAIN_NAME $OS_PROJECT_DOMAIN_NAME $OS_REGION_NAME $OS_INTERFACE'
+  envsubst "$allow" < "$src" > "$dst"
   echo "  rendered $src → $dst"
 }
 
 render_cluster_template() {
   export CLOUDS_YAML_B64
-  CLOUDS_YAML_B64=$(envsubst < "$SCRIPT_DIR/clouds.yaml.tmpl" | base64 -w0)
+  CLOUDS_YAML_B64=$(render_to_stdout "$SCRIPT_DIR/clouds.yaml.tmpl" | base64 -w0)
   render_template "$SCRIPT_DIR/cluster-template.yaml.tmpl" "$SCRIPT_DIR/cluster-template.yaml"
+}
+
+render_to_stdout() {
+  # Same envsubst allowlist as render_template but stdout only (for piping).
+  local src="$1"
+  local allow='$OS_AUTH_URL $OS_USERNAME $OS_PASSWORD $OS_PROJECT_NAME
+    $OS_USER_DOMAIN_NAME $OS_PROJECT_DOMAIN_NAME $OS_REGION_NAME $OS_INTERFACE
+    $CLOUD_NAME'
+  envsubst "$allow" < "$src"
 }
 
 install_cilium() {

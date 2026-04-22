@@ -40,8 +40,12 @@ ensure_capi() {
     echo "CAPI + CAPO already installed — skipping clusterctl init"
     return
   fi
-  echo "Running 'clusterctl init --infrastructure openstack'..."
-  clusterctl init --infrastructure openstack
+  echo "Running 'clusterctl init' with pinned CAPI=${CAPI_VERSION} CAPO=${CAPO_VERSION}..."
+  clusterctl init \
+    --core "cluster-api:${CAPI_VERSION}" \
+    --bootstrap "kubeadm:${CAPI_VERSION}" \
+    --control-plane "kubeadm:${CAPI_VERSION}" \
+    --infrastructure "openstack:${CAPO_VERSION}"
   # Wait for the provider controllers to come up
   for ns in capi-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capo-system; do
     kubectl -n "$ns" rollout status deploy --timeout=180s 2>&1 | sed "s/^/  [$ns] /"

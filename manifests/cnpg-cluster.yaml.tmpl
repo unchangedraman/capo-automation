@@ -37,4 +37,8 @@ spec:
   affinity:
     enablePodAntiAffinity: true
     topologyKey: kubernetes.io/hostname
-    podAntiAffinityType: required
+    # "preferred" lets the scheduler co-locate on the same node when there
+    # aren't enough distinct workers. In production with >= CNPG_INSTANCES
+    # workers, the scheduler still spreads them for real HA. On a single-worker
+    # lab this is the only way to get a replica to boot at all.
+    podAntiAffinityType: preferred

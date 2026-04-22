@@ -28,6 +28,11 @@ install_docker() {
   echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
     $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
   $SUDO apt-get update -qq
+  # Ubuntu 24.04 ships docker-compose-v2 which owns the same cli-plugin path
+  # as Docker's docker-compose-plugin; remove it first to avoid dpkg conflict.
+  if dpkg -l docker-compose-v2 2>/dev/null | grep -q '^ii'; then
+    $SUDO apt-get remove -y -qq docker-compose-v2 || true
+  fi
   $SUDO apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   $SUDO usermod -aG docker "${USER}"
   echo "NOTE: log out and back in (or run 'newgrp docker') so this shell sees docker group membership."
@@ -84,6 +89,17 @@ install_envsubst() {
   $SUDO apt-get install -y -qq gettext-base
 }
 
+install_openstack_client() {
+  # Need `openstack` CLI + octavia plugin so bootstrap-openstack-resources.sh
+  # can verify octavia (`openstack loadbalancer list`) and create flavors/keypair.
+  if command -v openstack >/dev/null && openstack loadbalancer --help >/dev/null 2>&1; then
+    echo "openstack CLI + octaviaclient already installed"
+    return
+  fi
+  section "Installing openstack CLI + octaviaclient"
+  $SUDO apt-get install -y -qq python3-openstackclient python3-octaviaclient
+}
+
 echo "Installing prerequisites (ARCH=${ARCH})..."
 install_envsubst
 install_docker
@@ -91,6 +107,7 @@ install_kubectl
 install_kind
 install_clusterctl
 install_helm
+install_openstack_client
 
 echo
 echo "========== Versions =========="

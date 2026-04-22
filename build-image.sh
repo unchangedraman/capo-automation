@@ -114,14 +114,38 @@ EOF
       make "$target"
   )
 
-  # image-builder writes to images/capi/output/<image_name>-kube-v...
+  # image-builder writes to images/capi/output/<dir>/<disk-file> (no .qcow2 extension)
   local produced
-  produced=$(find "$capi_dir/output" -maxdepth 2 -name '*.qcow2' -newer "$capi_dir/packer/qemu/overrides.json" | head -1)
-  [ -n "$produced" ] || die "no qcow2 produced under $capi_dir/output"
+  produced=$(find "$capi_dir/output" -maxdepth 2 -type f -size +100M | head -1)
+  [ -n "$produced" ] && file "$produced" | grep -q "QCOW" \
+    || die "no qcow2-format disk produced under $capi_dir/output"
 
   mkdir -p "$BUILD_DIR"
   cp -f "$produced" "$OUT_QCOW2"
   info "produced: $OUT_QCOW2  ($(du -h "$OUT_QCOW2" | cut -f1))"
+}
+
+fix_containerd_sandbox_image() {
+  # image-builder (current rev) ships containerd v2.x whose default sandbox_image
+  # is pause:3.10.1. Our air-gapped tenant VMs can't pull from registry.k8s.io,
+  # but pause:3.9 *is* pre-loaded by image-builder's `kubeadm config images pull`
+  # for K8s v1.29. containerd v2 changed the config schema enough that sed-
+  # patching sandbox_image is fragile. Simpler: retag the pre-pulled pause:3.9
+  # under every known containerd-default tag so local cache hits on any of them.
+  # NOTE: virt-customize can't start containerd inside the image, but `ctr`
+  # operates on the containerd image store directly (boltdb files under
+  # /var/lib/containerd) so tagging works offline.
+  section "Retagging pre-pulled pause:3.9 as containerd-default tags"
+  virt-customize -a "$OUT_QCOW2" \
+    --run-command '
+      CTR=$(command -v ctr || echo /usr/local/bin/ctr)
+      "$CTR" --namespace=k8s.io images ls 2>&1 | grep pause || true
+      for TGT in registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1; do
+        "$CTR" --namespace=k8s.io images tag --force registry.k8s.io/pause:3.9 "$TGT" || true
+      done
+      "$CTR" --namespace=k8s.io images ls 2>&1 | grep pause
+    '
+  info "pause:3.9 retagged under 3.10 and 3.10.1"
 }
 
 customize_for_pgbench() {
@@ -238,6 +262,7 @@ case "$cmd" in
     check_host_deps
     fetch_image_builder
     run_image_builder
+    fix_containerd_sandbox_image
     customize_for_pgbench
     emit_manifest
     echo

@@ -83,19 +83,80 @@ check_quota() {
   local need_cpu=$(( (CP_REPLICAS + WORKER_REPLICAS) * 2 ))
   local need_ram=$(( (CP_REPLICAS + WORKER_REPLICAS) * 4096 ))
   local need_vols=$(( CNPG_INSTANCES ))
+  # openstack quota show without a project argument returns empty on some
+  # installs, which coalesces to 0 and produces a false "quota too low" warning.
+  local proj="${OS_PROJECT_NAME:-}"
+  if [ -z "$proj" ]; then
+    echo "WARN: OS_PROJECT_NAME unset — skipping quota check"
+    return
+  fi
+  # -1 means unlimited in OpenStack quotas; treat as OK.
+  _cmp() {
+    local label=$1 cur=$2 need=$3 unit=$4
+    if [ "$cur" = "-1" ]; then
+      echo "$label quota OK (unlimited, need $need$unit)"
+    elif [ "$cur" -lt "$need" ] 2>/dev/null; then
+      echo "WARN: $label quota ($cur$unit) < needed ($need$unit)"
+    else
+      echo "$label quota OK ($cur$unit >= $need$unit)"
+    fi
+  }
   local cur
-  cur=$(openstack quota show -f value -c cores 2>/dev/null || echo 0)
-  [ "$cur" -lt "$need_cpu" ] 2>/dev/null \
-    && echo "WARN: cores quota ($cur) < needed ($need_cpu)" \
-    || echo "cores quota OK ($cur >= $need_cpu)"
-  cur=$(openstack quota show -f value -c ram 2>/dev/null || echo 0)
-  [ "$cur" -lt "$need_ram" ] 2>/dev/null \
-    && echo "WARN: ram quota ($cur MiB) < needed ($need_ram MiB)" \
-    || echo "ram quota OK ($cur MiB >= $need_ram MiB)"
-  cur=$(openstack quota show -f value -c volumes 2>/dev/null || echo 0)
-  [ "$cur" -lt "$need_vols" ] 2>/dev/null \
-    && echo "WARN: volumes quota ($cur) < needed ($need_vols)" \
-    || echo "volumes quota OK ($cur >= $need_vols)"
+  cur=$(openstack quota show "$proj" -f value -c cores   2>/dev/null); _cmp cores   "${cur:-0}" "$need_cpu"  ""
+  cur=$(openstack quota show "$proj" -f value -c ram     2>/dev/null); _cmp ram     "${cur:-0}" "$need_ram" " MiB"
+  cur=$(openstack quota show "$proj" -f value -c volumes 2>/dev/null); _cmp volumes "${cur:-0}" "$need_vols" ""
+}
+
+check_orphan_volumes() {
+  # After destroying a previous CAPO cluster, Cinder can leave volumes in
+  # 'available' state that silently fail to delete because a dead QEMU still
+  # holds an RBD exclusive-lock. Those volumes consume Cinder quota and RBD
+  # space forever. Detecting them here lets the user fix before running
+  # create-cluster.sh and hitting quota errors mid-provision.
+  local stuck
+  stuck=$(openstack volume list --status available --long -f value -c Name 2>/dev/null | grep -E '(my-k8s|capi|cnpg|pvc-)' | wc -l)
+  if [ "${stuck:-0}" -gt 0 ]; then
+    echo "WARN: $stuck orphan Cinder volume(s) in 'available' state from a previous deploy."
+    echo "      If they won't delete via 'openstack volume delete' (ImageBusy error),"
+    echo "      run the admin-keyring lock cleanup:"
+    echo "         ~/Desktop/namma-cloud/scripts/kolla-ansible/cleanup-orphan-rbd-locks.sh <vdc-name> --delete"
+    echo "      On non-VDC (real) OpenStack, talk to the Cinder admin to break locks."
+  else
+    echo "No orphan Cinder volumes detected"
+  fi
+}
+
+ensure_cilium_overlay_sg() {
+  # CAPO's managedSecurityGroups reconciler wipes any rule it doesn't own, so
+  # we can't just append VXLAN rules to the CP/worker SGs. Instead, create a
+  # standalone SG that CAPO leaves alone and reference it from each
+  # OpenStackMachineTemplate.securityGroups. Opens:
+  #   - UDP 8472 : Cilium VXLAN overlay (default tunnelProtocol)
+  #   - UDP 6081 : Geneve (in case Cilium is reconfigured)
+  #   - TCP 4240 : cilium-health endpoint
+  #   - ICMP     : pod<->pod + cilium-health ICMP probes
+  # All restricted to the cluster's NODE_CIDR so only nodes inside this
+  # cluster can talk VXLAN to each other.
+  local name="${CILIUM_OVERLAY_SG_NAME}"
+  if openstack security group show "$name" >/dev/null 2>&1; then
+    echo "Cilium overlay SG '$name' exists"
+    return
+  fi
+  echo "creating Cilium overlay SG '$name'"
+  openstack security group create "$name" \
+    --description "Cilium VXLAN overlay + health for ${CLUSTER_NAME}" >/dev/null
+  for rule in \
+      "udp 8472" \
+      "udp 6081" \
+      "tcp 4240"; do
+    read -r proto port <<<"$rule"
+    openstack security group rule create --ingress \
+      --protocol "$proto" --dst-port "$port" \
+      --remote-ip "${NODE_CIDR}" "$name" >/dev/null
+  done
+  openstack security group rule create --ingress \
+    --protocol icmp --remote-ip "${NODE_CIDR}" "$name" >/dev/null
+  echo "  opened UDP 8472 / 6081, TCP 4240, ICMP from ${NODE_CIDR}"
 }
 
 echo '========== Bootstrapping OpenStack resources =========='
@@ -119,6 +180,12 @@ ensure_flavor "${WORKER_FLAVOR}" 2 4096 20
 
 echo; echo 'Step 6: SSH keypair'
 ensure_keypair "${SSH_KEY_NAME}"
+
+echo; echo 'Step 7: Cilium overlay SG (works around CAPO SG reconciler)'
+ensure_cilium_overlay_sg
+
+echo; echo 'Step 8: orphan Cinder volumes check'
+check_orphan_volumes
 
 echo
 echo '========== OpenStack resources ready =========='
